@@ -1,0 +1,29 @@
+# Sensitive credentials - NEVER commit these
+credentials.json
+.env
+
+# Data files - too large / regenerated at runtime
+leads.csv
+leads.csv.corrupted.bak
+leads.csv.bak
+*.bak
+live_city_leads.csv
+new_leads.csv
+reddit_leads.csv
+
+# State files written at runtime
+seen_ids.json
+post_rows.json
+
+# Logs
+*.log
+scraper_live.log
+dashboard_running.log
+dashboard_restart.log
+dashboard_debug.log
+dashboard_fresh.log
+
+# Junk
+nul
+__pycache__/
+*.pyc
