@@ -26,18 +26,67 @@ SUBS = [
     "RealEstate", "RealEstateInvesting", "Homeowners",
     "FirstTimeHomeSeller", "povertyfinance", "DebtFree", "credit",
     "loanoriginators", "investing", "homebuying", "REBubble",
-    "financialindependence", "fatFIRE", "Frugal", "ChubbyFIRE", "leanfire"
+    "financialindependence", "fatFIRE", "Frugal", "ChubbyFIRE", "leanfire",
+    "mortgagepros", "HomeLoan", "AskaLoanOfficer", "Loans", "BadCredit",
+    "DebtManagement", "MoneyDiaries", "RealEstateTechnology"
 ]
 
-KEYWORDS = [
+# Set A: Original keywords (broad coverage)
+KEYWORDS_SET_A = [
     "mortgage", "rate", "refi", "lender", "credit", "buy home", "first time", "pre-approve",
     "interest rate", "7%", "7.5%", "8%", "high rate", "fha", "va loan", "conventional",
     "pmi", "down payment", "closing cost", "pre-qual", "underwater", "cash out",
     "heloc", "home equity", "arm loan", "adjustable", "rate lock", "buydown",
     "can't afford", "cant afford", "too high", "trapped", "stuck at", "payment",
     "home loan", "loan officer", "broker", "points", "origination", "qualify",
-    "debt to income", "dti", "escrow", "appraisal", "refinancing"
+    "debt to income", "dti", "escrow", "appraisal", "refinancing",
+    "home purchase", "closing", "title insurance", "homeowners insurance", "inspection",
+    "contingency", "underwriting", "processing", "balloon payment", "15-year mortgage",
+    "30-year mortgage", "jumbo loan", "investment property", "landlord", "principal payment",
+    "equity building", "credit freeze", "bankruptcy", "foreclosure", "deed in lieu",
+    "loan modification", "forbearance", "home buyer", "property tax", "earnest money"
 ]
+
+# Set B: Alternate keywords (different angle, more specific terms & problem-focused)
+KEYWORDS_SET_B = [
+    "fixed rate", "adjustable rate", "rate increase", "annual percentage", "APR",
+    "loan officer", "loan estimate", "closing disclosure", "title insurance", "appraisal fee",
+    "origination fee", "prepayment penalty", "escrow account", "good faith estimate",
+    "homeowner", "homeownership", "property value", "equity", "principal", "principal reduction",
+    "loan modification", "forbearance", "short sale", "foreclosure", "negative equity",
+    "debt consolidation", "credit repair", "FICO score", "credit bureau", "credit report",
+    "lower payment", "save money", "best rates", "lowest rate", "compare rates", "APY",
+    "USDA loan", "FHA insured", "conventional loan", "jumbo loan", "portfolio loan",
+    "seller financing", "private lender", "hard money", "bridge loan", "renovation loan",
+    "first time homebuyer", "first-time buyer", "home purchase", "home buying", "new homeowner",
+    "refinance rates", "rate shopping", "lock rate", "rate guarantee", "rate sheet",
+    "clear to close", "walkthrough", "lender requirements", "HOA approval", "title search",
+    "appraisal waived", "appraisal contingency", "rate contingency", "inspection contingency",
+    "float down", "ARM conversion", "streamline refinance", "cash-out refi", "no-cash-out refi",
+    "VA streamline", "FHA streamline", "document collection", "mortgage commitment",
+    "wire transfer", "down payment assistance", "construction loan", "new construction",
+    "HELOC rates", "HEL vs HELOC", "refinance timeline", "equity release", "underwriting requirements"
+]
+
+def get_active_keywords():
+    """Return active keyword set based on hourly rotation in Central Time (Chicago).
+    Alternates between SET_A and SET_B every hour.
+    Even hours (0,2,4...22): SET_A
+    Odd hours (1,3,5...23): SET_B
+    """
+    from datetime import datetime, timezone, timedelta
+    # Convert UTC to Central Time (UTC-6 for CST, handles DST automatically)
+    ct = datetime.now(timezone(timedelta(hours=-6)))
+    hour = ct.hour
+    return KEYWORDS_SET_A if hour % 2 == 0 else KEYWORDS_SET_B
+
+def handle_rate_limit(wait_seconds=60):
+    """Handle 429 rate limit: log and pause gracefully."""
+    print(f"\n[RATE LIMITED] 429 - Pausing for {wait_seconds} seconds...", flush=True)
+    for i in range(wait_seconds, 0, -10):
+        print(f"  Resuming in {i}s...", flush=True)
+        time.sleep(10)
+    print(f"[RESUMED] Restarting scraper", flush=True)
 
 CSV_PATH = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\leads.csv"
 CSV_LOCAL = r"C:\Users\user\Downloads\leads.csv"
@@ -76,6 +125,22 @@ def load_post_rows():
 def save_post_rows(post_rows):
     with open(POST_ROWS_FILE, 'w') as f:
         json.dump(post_rows, f)
+
+
+def load_post_resightings():
+    """Load resighting counter for each post (how many times re-seen in top 50)."""
+    resightings_file = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\post_resightings.json"
+    if os.path.isfile(resightings_file):
+        with open(resightings_file, 'r') as f:
+            return json.load(f)
+    return {}
+
+
+def save_post_resightings(resightings):
+    """Save resighting counter."""
+    resightings_file = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\post_resightings.json"
+    with open(resightings_file, 'w') as f:
+        json.dump(resightings, f)
 
 
 def apply_row_group(sh, worksheet, post_row_1indexed, num_comments):
@@ -292,6 +357,9 @@ retrofit_done = False
 collapse_done = False
 post_row_map = load_post_rows()
 print(f"Loaded {len(post_row_map)} post row mappings.", flush=True)
+post_resightings = load_post_resightings()
+print(f"Loaded resighting counts for {len(post_resightings)} posts.", flush=True)
+print(f"Keyword rotation ENABLED: Hourly alternation between SET_A (70 terms) and SET_B (83 terms)", flush=True)
 
 while True:
     random.shuffle(SUBS)
@@ -319,6 +387,11 @@ while True:
         collapse_existing_groups(sh, worksheet)
         collapse_done = True
 
+    # Log which keyword set is active this cycle
+    active_keywords = get_active_keywords()
+    active_set = "SET_A" if active_keywords == KEYWORDS_SET_A else "SET_B"
+    print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Using keywords {active_set} ({len(active_keywords)} terms)", flush=True)
+
     for sub in SUBS:
         headers = {"User-Agent": random.choice(USER_AGENTS)}
         url = f"https://www.reddit.com/r/{sub}/new.json?limit=50"
@@ -326,49 +399,76 @@ while True:
         print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Checking r/{sub}...", flush=True)
         try:
             r = requests.get(url, headers=headers, timeout=10)
+
+            # Check for rate limiting
+            if r.status_code == 429:
+                handle_rate_limit(120)
+                continue
+
             r.raise_for_status()
             data = r.json()
 
             for post in data['data']['children']:
                 p = post['data']
                 title_lower = p['title'].lower()
-                if any(kw in title_lower for kw in KEYWORDS) and p['id'] not in seen_ids:
-                    try:
-                        r = requests.get(
-                            f"https://www.reddit.com{p['permalink']}.json",
-                            headers={"User-Agent": headers["User-Agent"]},
-                            timeout=10
-                        )
-                        if r.status_code == 200:
-                            full = r.json()
-                            post_data = full[0]['data']['children'][0]['data']
-                            author = post_data.get('author', '[deleted]')
-                            title = post_data['title']
-                            selftext = post_data.get('selftext', '')
-                            permalink = f"https://www.reddit.com{p['permalink']}"
-                            created_utc = post_data['created_utc']
-                            seen_ids.add(p['id'])
-                            save_seen_ids(seen_ids)
-                            post_time = datetime.utcfromtimestamp(created_utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                            caught_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+                active_keywords = get_active_keywords()
+                post_id = p['id']
 
-                            all_rows = [["Post", p['id'], author, "N/A", sub, title, selftext, permalink, post_time, p.get('num_comments', 0), caught_time, ""]]
+                if any(kw in title_lower for kw in active_keywords):
+                    if post_id not in seen_ids:
+                        # NEW POST: fetch full details and capture comments
+                        try:
+                            r = requests.get(
+                                f"https://www.reddit.com{p['permalink']}.json",
+                                headers={"User-Agent": headers["User-Agent"]},
+                                timeout=10
+                            )
 
-                            for r_ in all_rows:
-                                csv_writer.writerow(r_)
-                                csv_local_writer.writerow(r_)
-                            csv_file.flush()
-                            csv_local_file.flush()
+                            # Check for rate limiting on detail request
+                            if r.status_code == 429:
+                                handle_rate_limit(120)
+                                continue
 
-                            if worksheet:
-                                worksheet.append_rows(all_rows)
+                            if r.status_code == 200:
+                                full = r.json()
+                                post_data = full[0]['data']['children'][0]['data']
+                                author = post_data.get('author', '[deleted]')
+                                title = post_data['title']
+                                selftext = post_data.get('selftext', '')
+                                permalink = f"https://www.reddit.com{p['permalink']}"
+                                created_utc = post_data['created_utc']
+                                seen_ids.add(post_id)
+                                save_seen_ids(seen_ids)
+                                post_time = datetime.utcfromtimestamp(created_utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+                                caught_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
 
-                            print(f"  *** POST: r/{sub} - {title[:50]}...", flush=True)
-                    except Exception as e:
-                        print(f"Error fetching r/{sub}: {e}", flush=True)
+                                all_rows = [["Post", post_id, author, "N/A", sub, title, selftext, permalink, post_time, p.get('num_comments', 0), caught_time, ""]]
+
+                                for r_ in all_rows:
+                                    csv_writer.writerow(r_)
+                                    csv_local_writer.writerow(r_)
+                                    csv_file.flush()
+                                    csv_local_file.flush()
+
+                                if worksheet:
+                                    worksheet.append_rows(all_rows)
+
+                                # Initialize resighting counter
+                                post_resightings[post_id] = 0
+                                print(f"  *** POST: r/{sub} - {title[:50]}...", flush=True)
+                        except Exception as e:
+                            print(f"Error fetching r/{sub}: {e}", flush=True)
+                    else:
+                        # POST RE-SIGHTED: increment counter (post is in top 50 again)
+                        if post_id not in post_resightings:
+                            post_resightings[post_id] = 0
+                        post_resightings[post_id] += 1
         except Exception as e:
             print(f"Error r/{sub}: {e}", flush=True)
 
-        time.sleep(random.uniform(10, 15))
+        # Increased sleep to avoid rate limiting with expanded subreddit list
+        time.sleep(random.uniform(20, 30))
 
+    # Save resighting data after each cycle
+    save_post_resightings(post_resightings)
     time.sleep(random.uniform(600, 900))

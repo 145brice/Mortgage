@@ -16,18 +16,30 @@ SHEET_ID = '11iSHWnP7FhtmZqJ0h5eMtrO1fEvEH7iF84NvI9hbAVA'
 # WARNING: setting this to True will write to the spreadsheet's first row.
 AUTO_FIX_HEADERS = False
 
+def load_resightings():
+    """Load post resighting counters."""
+    resightings_file = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\post_resightings.json"
+    if os.path.exists(resightings_file):
+        try:
+            with open(resightings_file, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
 def load_sheet_data():
     """Load data from CSV file (scraper writes to CSV)."""
     return read_csv_data()
 
 def read_csv_data():
-    """Read CSV data directly"""
+    """Read CSV data directly and enrich with resighting counters"""
     if not os.path.exists(CSV_PATH):
         print(f"CSV not found at {CSV_PATH}", flush=True)
         return [], {"posts": 0, "comments": 0}
 
     rows = []
     stats = {"posts": 0, "comments": 0}
+    resightings = load_resightings()
 
     try:
         with open(CSV_PATH, 'r', encoding='utf-8', newline='') as csvfile:
@@ -37,6 +49,14 @@ def read_csv_data():
             for row in reader:
                 if row:
                     row_dict = {col: (row.get(col) or '') for col in header}
+
+                    # Add resighting count if this is a post
+                    if row.get('Type') == 'Post':
+                        post_id = row.get('Post_ID', '')
+                        row_dict['Resightings'] = str(resightings.get(post_id, 0))
+                    else:
+                        row_dict['Resightings'] = ''
+
                     rows.append(row_dict)
 
                     if row.get('Type') == 'Post':
@@ -231,12 +251,34 @@ HTML_TEMPLATE = """
             </div>
         </div>
 
+        <div class="pagination-controls" style="margin-bottom: 20px; background: white; padding: 15px; border-radius: 10px; display: flex; justify-content: space-between; align-items: center;">
+            <div>
+                <label for="rows-per-page" style="margin-right: 10px; font-weight: 600;">Rows per page:</label>
+                <select id="rows-per-page" style="padding: 8px 12px; border: 1px solid #ddd; border-radius: 5px; font-size: 0.9em;">
+                    <option value="25">25</option>
+                    <option value="50" selected>50</option>
+                    <option value="100">100</option>
+                    <option value="200">200</option>
+                    <option value="999999">All</option>
+                </select>
+            </div>
+            <div>
+                <button id="prev-btn" style="padding: 8px 15px; margin-right: 10px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: 600;">← Previous</button>
+                <span id="page-info" style="margin-right: 10px; font-weight: 600;">Page 1</span>
+                <button id="next-btn" style="padding: 8px 15px; background: #667eea; color: white; border: none; border-radius: 5px; cursor: pointer; font-weight: 600;">Next →</button>
+            </div>
+        </div>
+
         <div class="data-table">
             <table>
                 <thead>
                     <tr>
                         <th>Type</th>
                         <th>ID</th>
+                        <th style="text-align: center;">Re-sights</th>
+                        <th style="text-align: center;">Comments</th>
+                        <th>Posted</th>
+                        <th>Caught</th>
                         <th>Author</th>
                         <th>Content</th>
                         <th style="text-align: center;">Link</th>
@@ -244,16 +286,54 @@ HTML_TEMPLATE = """
                     </tr>
                 </thead>
                 <tbody id="data-body">
-                    <tr><td colspan="6" class="no-data">Loading data...</td></tr>
+                    <tr><td colspan="10" class="no-data">Loading data...</td></tr>
                 </tbody>
             </table>
         </div>
     </div>
 
     <script>
+        // Convert UTC time string to Central Standard Time
+        function convertUTCtoCST(utcTimeStr) {
+            try {
+                // Parse "2026-02-22 04:02:02 UTC" format
+                const cleanStr = utcTimeStr.replace(' UTC', '').trim();
+                const utcDate = new Date(cleanStr + ' UTC');
+                const cstTime = utcDate.toLocaleString('en-US', {
+                    timeZone: 'America/Chicago',
+                    year: 'numeric',
+                    month: '2-digit',
+                    day: '2-digit',
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                    hour12: false
+                });
+                // Return in format YYYY-MM-DD HH:MM
+                return cstTime.replace(/(\d{2})\/(\d{2})\/(\d{4}), (\d{2}):(\d{2})/, '$3-$1-$2 $4:$5');
+            } catch(e) {
+                return utcTimeStr;
+            }
+        }
+
         let currentData = [];
         let sortColumn = null;
         let sortAsc = true;
+        let currentPage = 1;
+        let rowsPerPage = 50;
+
+        function getPaginatedRows(rows) {
+            const start = (currentPage - 1) * rowsPerPage;
+            const end = start + rowsPerPage;
+            return rows.slice(start, end);
+        }
+
+        function updatePaginationInfo(totalRows) {
+            const maxPage = Math.ceil(totalRows / rowsPerPage);
+            document.getElementById('page-info').textContent = `Page ${currentPage} of ${maxPage}`;
+            document.getElementById('prev-btn').disabled = currentPage === 1;
+            document.getElementById('next-btn').disabled = currentPage >= maxPage;
+        }
 
         function renderTable(rows) {
             const tbody = document.getElementById('data-body');
@@ -262,7 +342,7 @@ HTML_TEMPLATE = """
             if (rows.length === 0) {
                 const tr = document.createElement('tr');
                 const td = document.createElement('td');
-                td.colSpan = 6;
+                td.colSpan = 10;
                 td.className = 'no-data';
                 td.textContent = 'No data yet. Scraper running...';
                 tr.appendChild(td);
@@ -270,7 +350,11 @@ HTML_TEMPLATE = """
                 return;
             }
 
-            rows.forEach(row => {
+            // Get paginated rows
+            const paginatedRows = getPaginatedRows(rows);
+            updatePaginationInfo(rows.length);
+
+            paginatedRows.forEach(row => {
                 const tr = document.createElement('tr');
 
                 // Type
@@ -288,6 +372,42 @@ HTML_TEMPLATE = """
                 idCode.textContent = (row.Post_ID || '-').substring(0, 6);
                 idCell.appendChild(idCode);
                 tr.appendChild(idCell);
+
+                // Re-sightings (engagement count)
+                const resightCell = document.createElement('td');
+                resightCell.style.textAlign = 'center';
+                resightCell.style.fontWeight = 'bold';
+                resightCell.style.color = row.Resightings && parseInt(row.Resightings) > 0 ? '#ff6b6b' : '#999';
+                resightCell.textContent = row.Resightings || '-';
+                tr.appendChild(resightCell);
+
+                // Comment Count
+                const commentCell = document.createElement('td');
+                commentCell.style.textAlign = 'center';
+                commentCell.style.fontWeight = 'bold';
+                commentCell.style.color = '#667eea';
+                commentCell.textContent = (row.Type === 'Post') ? (row['Comment Count'] || '0') : '-';
+                tr.appendChild(commentCell);
+
+                // Posted Time (UTC -> CST)
+                const postedCell = document.createElement('td');
+                postedCell.style.fontSize = '0.75em';
+                postedCell.style.color = '#666';
+                const postedTime = row['Post Time (UTC)'] || '';
+                const postedCST = postedTime ? convertUTCtoCST(postedTime) : '-';
+                postedCell.title = postedTime + ' (UTC)';
+                postedCell.textContent = postedCST;
+                tr.appendChild(postedCell);
+
+                // Caught Time (UTC -> CST)
+                const caughtCell = document.createElement('td');
+                caughtCell.style.fontSize = '0.75em';
+                caughtCell.style.color = '#666';
+                const caughtTime = row['Caught Time (UTC)'] || '';
+                const caughtCST = caughtTime ? convertUTCtoCST(caughtTime) : '-';
+                caughtCell.title = caughtTime + ' (UTC)';
+                caughtCell.textContent = caughtCST;
+                tr.appendChild(caughtCell);
 
                 // Author
                 const authorCell = document.createElement('td');
@@ -377,24 +497,45 @@ HTML_TEMPLATE = """
                     document.getElementById('post-count').textContent = data.stats.posts;
                     document.getElementById('comment-count').textContent = data.stats.comments;
                     document.getElementById('total-count').textContent = data.stats.posts + data.stats.comments;
-                    document.getElementById('last-update').textContent = 'Last update: ' + new Date().toLocaleTimeString();
+                    const cstTime = new Date().toLocaleTimeString('en-US', { timeZone: 'America/Chicago' });
+                    document.getElementById('last-update').textContent = 'Last update: ' + cstTime + ' (CST)';
 
-                    currentData = data.rows.reverse();
+                    currentData = data.rows;
                     renderTable(currentData);
                 })
                 .catch(e => console.error('Error:', e));
         }
 
         // Add click handlers to headers
-        document.querySelectorAll('thead th').forEach(th => {
+        document.querySelectorAll('thead th').forEach((th, idx) => {
             th.addEventListener('click', () => {
-                const colNames = ['Type', 'Post_ID', 'Author', 'Title', 'Subreddit'];
-                const colIdx = Array.from(th.parentNode.children).indexOf(th);
-                const colMap = ['Type', 'Post_ID', 'Author', 'Title', 'Subreddit'];
-                if (colIdx < colMap.length) {
-                    sortTable(colMap[colIdx]);
+                const colMap = ['Type', 'Post_ID', 'Resightings', 'Comment Count', 'Post Time (UTC)', 'Caught Time (UTC)', 'Author', 'Title', 'Link', 'Subreddit'];
+                if (idx < colMap.length) {
+                    sortTable(colMap[idx]);
                 }
             });
+        });
+
+        // Pagination controls
+        document.getElementById('rows-per-page').addEventListener('change', (e) => {
+            rowsPerPage = parseInt(e.target.value);
+            currentPage = 1;
+            renderTable(currentData);
+        });
+
+        document.getElementById('prev-btn').addEventListener('click', () => {
+            if (currentPage > 1) {
+                currentPage--;
+                renderTable(currentData);
+            }
+        });
+
+        document.getElementById('next-btn').addEventListener('click', () => {
+            const maxPage = Math.ceil(currentData.length / rowsPerPage);
+            if (currentPage < maxPage) {
+                currentPage++;
+                renderTable(currentData);
+            }
         });
 
         // Initial load
@@ -429,14 +570,58 @@ def debug():
     except Exception as e:
         return jsonify({"error": str(e)})
 
+def sort_rows_by_post_time(rows):
+    """Group posts with their comments, sort by Post Time (UTC) descending (newest first)."""
+    if not rows:
+        return []
+
+    # Group posts with their comments
+    groups = []
+    current_group = []
+
+    for row in rows:
+        if row.get('Type') == 'Post':
+            if current_group:
+                groups.append(current_group)
+            current_group = [row]
+        else:
+            current_group.append(row)
+
+    if current_group:
+        groups.append(current_group)
+
+    # Sort groups by post's Post Time (UTC) descending - newest first
+    def get_post_time(group):
+        post = group[0]
+        post_time = post.get('Post Time (UTC)', '')
+        try:
+            # Parse "2026-02-22 04:02:02 UTC" format
+            from datetime import datetime
+            dt = datetime.strptime(post_time.replace(' UTC', ''), '%Y-%m-%d %H:%M:%S')
+            return dt.timestamp()
+        except:
+            return 0
+
+    groups.sort(key=get_post_time, reverse=True)
+
+    # Flatten back to list
+    sorted_rows = []
+    for group in groups:
+        sorted_rows.extend(group)
+
+    return sorted_rows
+
 @app.route('/api/data')
 def get_data():
     # Use Google Sheets (scraper uploads here, it was working!)
     rows, stats = load_sheet_data()
 
-    # Return last 100 rows
+    # Sort rows by Post Time (UTC) descending - newest Reddit posts first
+    sorted_rows = sort_rows_by_post_time(rows)
+
+    # Return all sorted rows (or last 100 if preferred)
     data = {
-        'rows': rows[-100:] if rows else [],
+        'rows': sorted_rows,
         'stats': stats,
         'timestamp': datetime.now().isoformat()
     }
@@ -444,6 +629,8 @@ def get_data():
     return jsonify(data)
 
 if __name__ == '__main__':
+    import sys
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
     print("Starting Reddit Mortgage Scraper Dashboard...", flush=True)
-    print("Open your browser to: http://localhost:5000", flush=True)
-    app.run(debug=False, host='localhost', port=5000, threaded=True)
+    print(f"Open your browser to: http://localhost:{port}", flush=True)
+    app.run(debug=True, host='localhost', port=port, threaded=True)
