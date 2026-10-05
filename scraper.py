@@ -8,9 +8,22 @@ import json
 import gspread
 import re
 import os
+import html
+import sys
+from urllib.parse import quote, urljoin
+from xml.etree import ElementTree
 from dotenv import load_dotenv
+from scraper_runtime import (
+    PID_PATH, clear_stop_request, interruptible_sleep, load_runtime_config,
+    stop_requested, update_status,
+)
 
 load_dotenv()
+
+if hasattr(sys.stdout, 'reconfigure'):
+    sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'reconfigure'):
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
 USER_AGENTS = [
     "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
@@ -21,6 +34,127 @@ USER_AGENTS = [
     "Mozilla/5.0 (Linux; Android 12; SM-S901B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/92.0.4515.159 Mobile Safari/537.36"
 ]
 
+
+class RedditOAuthClient:
+    """Small application-only OAuth client for Reddit read requests."""
+    def __init__(self):
+        self.client_id = os.getenv('REDDIT_CLIENT_ID', '').strip()
+        self.client_secret = os.getenv('REDDIT_CLIENT_SECRET', '').strip()
+        self.user_agent = os.getenv(
+            'REDDIT_USER_AGENT', 'windows:reddit-mortgage-leads:1.0 (local operator)'
+        ).strip()
+        self.session = requests.Session()
+        self.expires_at = 0
+
+    @property
+    def configured(self):
+        return bool(self.client_id and self.client_secret and self.user_agent)
+
+    def authenticate(self, timeout):
+        response = requests.post(
+            'https://www.reddit.com/api/v1/access_token',
+            auth=(self.client_id, self.client_secret),
+            data={'grant_type': 'client_credentials'},
+            headers={'User-Agent': self.user_agent},
+            timeout=timeout,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        token = payload.get('access_token')
+        if not token:
+            raise RuntimeError('Reddit OAuth response did not include an access token.')
+        self.session.headers.update({
+            'Authorization': f'bearer {token}',
+            'User-Agent': self.user_agent,
+        })
+        self.expires_at = time.time() + max(60, int(payload.get('expires_in', 3600)) - 60)
+
+    def get(self, path, timeout, params=None):
+        if time.time() >= self.expires_at:
+            self.authenticate(timeout)
+        return self.session.get(
+            f'https://oauth.reddit.com{path}', params=params, timeout=timeout
+        )
+
+
+ATOM = {'atom': 'http://www.w3.org/2005/Atom'}
+
+
+def subreddit_batches(subreddits, batch_size=5):
+    size = max(1, int(batch_size))
+    return [subreddits[index:index + size] for index in range(0, len(subreddits), size)]
+
+
+def rss_url_for_batch(subreddits, limit):
+    names = '+'.join(quote(name, safe='_') for name in subreddits)
+    return f'https://www.reddit.com/r/{names}/new/.rss?limit={min(100, max(1, int(limit)))}'
+
+
+def parse_rss_listing(xml_text, fallback_subreddit):
+    root = ElementTree.fromstring(xml_text)
+    posts = []
+    for entry in root.findall('atom:entry', ATOM):
+        post_id = (entry.findtext('atom:id', default='', namespaces=ATOM) or '').strip()
+        title = (entry.findtext('atom:title', default='', namespaces=ATOM) or '').strip()
+        if not post_id or not title:
+            continue
+        content = entry.findtext('atom:content', default='', namespaces=ATOM) or ''
+        soup = BeautifulSoup(html.unescape(content), 'html.parser')
+        for paragraph in soup.find_all('p'):
+            text = paragraph.get_text(' ', strip=True).lower()
+            if 'submitted by' in text and '[comments]' in text:
+                paragraph.decompose()
+        link_tag = entry.find('atom:link', ATOM)
+        category = entry.find('atom:category', ATOM)
+        subreddit = ((category.get('term', '') if category is not None else '')
+                     .strip().removeprefix('r/')) or fallback_subreddit
+        author = (entry.findtext('atom:author/atom:name', default='', namespaces=ATOM) or '').strip()
+        posts.append({
+            'id': post_id.removeprefix('t3_'),
+            'author': author.removeprefix('/u/') or '[deleted]',
+            'subreddit': subreddit,
+            'title': BeautifulSoup(title, 'html.parser').get_text(' ', strip=True),
+            'selftext': soup.get_text(' ', strip=True),
+            'permalink': urljoin('https://www.reddit.com', link_tag.get('href', '') if link_tag is not None else ''),
+            'created': (entry.findtext('atom:updated', default='', namespaces=ATOM) or '').strip(),
+            'num_comments': 0,
+        })
+    return posts
+
+
+def parse_comment_rss(xml_text, parent_post, limit=100):
+    """Return comments from a Reddit post's public Atom feed."""
+    root = ElementTree.fromstring(xml_text)
+    comments = []
+    for entry in root.findall('atom:entry', ATOM):
+        fullname = (entry.findtext('atom:id', default='', namespaces=ATOM) or '').strip()
+        if not fullname.startswith('t1_'):
+            continue
+        content = entry.findtext('atom:content', default='', namespaces=ATOM) or ''
+        body = BeautifulSoup(html.unescape(content), 'html.parser').get_text(' ', strip=True)
+        if not body:
+            continue
+        link_tag = entry.find('atom:link', ATOM)
+        author = (entry.findtext('atom:author/atom:name', default='', namespaces=ATOM) or '').strip()
+        comments.append({
+            'id': fullname.removeprefix('t1_'),
+            'author': author.removeprefix('/u/') or '[deleted]',
+            'body': body,
+            'permalink': urljoin('https://www.reddit.com', link_tag.get('href', '') if link_tag is not None else parent_post['permalink']),
+            'created': (entry.findtext('atom:updated', default='', namespaces=ATOM) or '').strip(),
+        })
+        if len(comments) >= max(0, int(limit)):
+            break
+    return comments
+
+
+def rss_time_to_csv(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        return parsed.strftime('%Y-%m-%d %H:%M:%S UTC')
+    except (TypeError, ValueError):
+        return value
+
 SUBS = [
     "Mortgages", "FirstTimeHomeBuyer", "refinance", "personalfinance",
     "RealEstate", "RealEstateInvesting", "Homeowners",
@@ -28,7 +162,37 @@ SUBS = [
     "loanoriginators", "investing", "homebuying", "REBubble",
     "financialindependence", "fatFIRE", "Frugal", "ChubbyFIRE", "leanfire",
     "mortgagepros", "HomeLoan", "AskaLoanOfficer", "Loans", "BadCredit",
-    "DebtManagement", "MoneyDiaries", "RealEstateTechnology"
+    "DebtManagement", "MoneyDiaries", "RealEstateTechnology",
+    "Landlord", "realtors", "CommercialRealEstate", "RentalInvesting",
+    "PropertyManagement", "HomeImprovement", "Flipping"
+]
+
+# Proven terms from the original scraper. These remain active every hour.
+CORE_KEYWORDS = [
+    "mortgage", "rate", "refi", "lender", "credit", "buy home",
+    "first time", "pre-approve", "help", "how do i", "what should i",
+    "need lender", "bad credit", "refinance", "pre-qualify",
+    "payment", "broker", "closing", "inspection", "refinancing", "fha",
+    "homeowner", "landlord", "equity", "home buyer", "credit report",
+    "points", "down payment", "conventional", "bankruptcy", "closing cost",
+    "interest rate", "principal", "escrow", "property tax", "save money",
+    "loan officer", "new construction", "debt consolidation", "home loan",
+    "appraisal", "underwriting", "cash out", "heloc", "foreclosure", "pmi",
+    "home equity", "qualify", "cash-out refi", "homeowners insurance",
+]
+
+# Explicit percentages catch high-intent titles such as "Is 6.75% a good rate?"
+RATE_KEYWORDS = [
+    "3%", "3.125%", "3.25%", "3.375%", "3.5%", "3.625%", "3.75%", "3.875%",
+    "4%", "4.125%", "4.25%", "4.375%", "4.5%", "4.625%", "4.75%", "4.875%",
+    "5%", "5.125%", "5.25%", "5.375%", "5.5%", "5.625%", "5.75%", "5.875%",
+    "6%", "6.125%", "6.25%", "6.375%", "6.5%", "6.625%", "6.75%", "6.875%",
+    "7%", "7.125%", "7.25%", "7.375%", "7.5%", "7.625%", "7.75%", "7.875%",
+    "8%", "8.125%", "8.25%", "8.375%", "8.5%", "8.625%", "8.75%", "8.875%",
+    "9%", "9.125%", "9.25%", "9.375%", "9.5%", "9.625%", "9.75%", "9.875%",
+    "10%",
+    "mortgage rate", "interest rate", "rate quote", "rate lock",
+    "rate drop", "rates dropped", "lower rate", "high rate",
 ]
 
 # Set A: Original keywords (broad coverage)
@@ -78,7 +242,8 @@ def get_active_keywords():
     # Convert UTC to Central Time (UTC-6 for CST, handles DST automatically)
     ct = datetime.now(timezone(timedelta(hours=-6)))
     hour = ct.hour
-    return KEYWORDS_SET_A if hour % 2 == 0 else KEYWORDS_SET_B
+    rotating_set = KEYWORDS_SET_A if hour % 2 == 0 else KEYWORDS_SET_B
+    return list(dict.fromkeys(CORE_KEYWORDS + RATE_KEYWORDS + rotating_set))
 
 def handle_rate_limit(wait_seconds=60):
     """Handle 429 rate limit: log and pause gracefully."""
@@ -88,10 +253,11 @@ def handle_rate_limit(wait_seconds=60):
         time.sleep(10)
     print(f"[RESUMED] Restarting scraper", flush=True)
 
-CSV_PATH = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\leads.csv"
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+CSV_PATH = os.path.join(PROJECT_DIR, 'leads.csv')
 CSV_LOCAL = r"C:\Users\user\Downloads\leads.csv"
-SEEN_IDS_FILE = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\seen_ids.json"
-POST_ROWS_FILE = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\post_rows.json"
+SEEN_IDS_FILE = os.path.join(PROJECT_DIR, 'seen_ids.json')
+POST_ROWS_FILE = os.path.join(PROJECT_DIR, 'post_rows.json')
 
 
 def open_csv(path):
@@ -347,6 +513,9 @@ def ensure_row_capacity(sh, worksheet, target_rows=100000):
 
 csv_file, csv_writer = open_csv(CSV_PATH)
 csv_local_file, csv_local_writer = open_csv(CSV_LOCAL)
+clear_stop_request()
+with open(PID_PATH, 'w', encoding='utf-8') as pid_file:
+    pid_file.write(str(os.getpid()))
 
 print("Scraping Reddit (sending to Google Sheet + local CSV)...", flush=True)
 
@@ -359,19 +528,34 @@ post_row_map = load_post_rows()
 print(f"Loaded {len(post_row_map)} post row mappings.", flush=True)
 post_resightings = load_post_resightings()
 print(f"Loaded resighting counts for {len(post_resightings)} posts.", flush=True)
-print(f"Keyword rotation ENABLED: Hourly alternation between SET_A (70 terms) and SET_B (83 terms)", flush=True)
+print("Keyword rotation ENABLED: permanent original/rate terms plus hourly SET_A/SET_B", flush=True)
+rss_session = requests.Session()
+rss_headers = {'User-Agent': os.getenv(
+    'REDDIT_USER_AGENT', 'windows:reddit-mortgage-leads:1.0 (local operator)'
+)}
 
+cycle_number = 0
+last_cycle_new_posts = 0
 while True:
-    random.shuffle(SUBS)
+    config = load_runtime_config()
+    cycle_number += 1
+    cycle_subs = list(SUBS)
+    if config['randomize_subreddits']:
+        random.shuffle(cycle_subs)
+    update_status(state='starting', pid=os.getpid(), cycle=cycle_number,
+                  current_subreddit=None, completed=0, total=len(cycle_subs),
+                  errors=0, new_posts=0, new_comments=0, stop_requested=False, error=None,
+                  source='New Reddit RSS', last_cycle_new_posts=last_cycle_new_posts)
     sh = None
     worksheet = None
-    try:
-        gc = gspread.service_account(filename='credentials.json')
-        sheet_id = '11iSHWnP7FhtmZqJ0h5eMtrO1fEvEH7iF84NvI9hbAVA'
-        sh = gc.open_by_key(sheet_id)
-        worksheet = sh.sheet1
-    except Exception as e:
-        print(f"Google Sheets setup failed: {e}. Skipping.", flush=True)
+    if config['google_sheets']:
+        try:
+            gc = gspread.service_account(filename='credentials.json')
+            sheet_id = '11iSHWnP7FhtmZqJ0h5eMtrO1fEvEH7iF84NvI9hbAVA'
+            sh = gc.open_by_key(sheet_id)
+            worksheet = sh.sheet1
+        except Exception as e:
+            print(f"Google Sheets setup failed: {e}. Skipping.", flush=True)
 
     # Ensure sheet has enough rows
     if worksheet and sh:
@@ -388,87 +572,151 @@ while True:
         collapse_done = True
 
     # Log which keyword set is active this cycle
-    active_keywords = get_active_keywords()
-    active_set = "SET_A" if active_keywords == KEYWORDS_SET_A else "SET_B"
+    active_keywords = (get_active_keywords() if config['keyword_rotation'] else
+                       list(dict.fromkeys(CORE_KEYWORDS + RATE_KEYWORDS + KEYWORDS_SET_A)))
+    active_set = "SET_A" if datetime.now().hour % 2 == 0 else "SET_B"
     print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Using keywords {active_set} ({len(active_keywords)} terms)", flush=True)
 
-    for sub in SUBS:
-        headers = {"User-Agent": random.choice(USER_AGENTS)}
-        url = f"https://www.reddit.com/r/{sub}/new.json?limit=50"
+    cycle_errors = 0
+    cycle_new_posts = 0
+    cycle_new_comments = 0
+    access_blocked = False
+    batches = subreddit_batches(cycle_subs, config['subreddits_per_request'])
+    for batch_index, batch in enumerate(batches):
+        if stop_requested():
+            update_status(state='stopping', stop_requested=True)
+            break
+        config = load_runtime_config()
+        completed_before = min(len(cycle_subs), batch_index * config['subreddits_per_request'])
+        completed_after = min(len(cycle_subs), completed_before + len(batch))
+        batch_label = ', '.join(f'r/{sub}' for sub in batch)
+        batch_status_label = ', '.join(batch)
+        update_status(state='scanning', source='New Reddit RSS', current_subreddit=batch_status_label,
+                      current_batch=batch_index + 1, total_batches=len(batches), completed=completed_before,
+                      total=len(cycle_subs), errors=cycle_errors,
+                      new_posts=cycle_new_posts, new_comments=cycle_new_comments,
+                      active_keyword_set=active_set)
 
-        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Checking r/{sub}...", flush=True)
+        print(f"[{datetime.utcnow().strftime('%H:%M:%S')}] Checking RSS batch {batch_index + 1}/{len(batches)}: {batch_label}", flush=True)
         try:
-            r = requests.get(url, headers=headers, timeout=10)
+            feed_limit = min(100, config['posts_limit'] * len(batch))
+            r = rss_session.get(
+                rss_url_for_batch(batch, feed_limit), headers=rss_headers,
+                timeout=config['request_timeout_sec'],
+            )
 
-            # Check for rate limiting
             if r.status_code == 429:
-                handle_rate_limit(120)
+                handle_rate_limit(config['rate_limit_pause_sec'])
                 continue
 
             r.raise_for_status()
-            data = r.json()
-
-            for post in data['data']['children']:
-                p = post['data']
-                title_lower = p['title'].lower()
-                active_keywords = get_active_keywords()
+            posts = parse_rss_listing(r.text, batch[0] if len(batch) == 1 else 'Unknown')
+            print(f"  Found {len(posts)} posts via New Reddit RSS", flush=True)
+            per_subreddit_counts = {}
+            for p in posts:
+                sub = p['subreddit']
+                key = sub.lower()
+                per_subreddit_counts[key] = per_subreddit_counts.get(key, 0) + 1
+                if per_subreddit_counts[key] > config['posts_limit']:
+                    continue
+                searchable_text = f"{p['title']} {p.get('selftext', '')}".lower()
+                active_keywords = (get_active_keywords() if config['keyword_rotation'] else
+                                   list(dict.fromkeys(CORE_KEYWORDS + RATE_KEYWORDS + KEYWORDS_SET_A)))
                 post_id = p['id']
 
-                if any(kw in title_lower for kw in active_keywords):
+                if any(kw.lower() in searchable_text for kw in active_keywords):
                     if post_id not in seen_ids:
-                        # NEW POST: fetch full details and capture comments
-                        try:
-                            r = requests.get(
-                                f"https://www.reddit.com{p['permalink']}.json",
-                                headers={"User-Agent": headers["User-Agent"]},
-                                timeout=10
-                            )
-
-                            # Check for rate limiting on detail request
-                            if r.status_code == 429:
-                                handle_rate_limit(120)
-                                continue
-
-                            if r.status_code == 200:
-                                full = r.json()
-                                post_data = full[0]['data']['children'][0]['data']
-                                author = post_data.get('author', '[deleted]')
-                                title = post_data['title']
-                                selftext = post_data.get('selftext', '')
-                                permalink = f"https://www.reddit.com{p['permalink']}"
-                                created_utc = post_data['created_utc']
-                                seen_ids.add(post_id)
-                                save_seen_ids(seen_ids)
-                                post_time = datetime.utcfromtimestamp(created_utc).strftime('%Y-%m-%d %H:%M:%S UTC')
-                                caught_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
-
-                                all_rows = [["Post", post_id, author, "N/A", sub, title, selftext, permalink, post_time, p.get('num_comments', 0), caught_time, ""]]
-
-                                for r_ in all_rows:
-                                    csv_writer.writerow(r_)
-                                    csv_local_writer.writerow(r_)
-                                    csv_file.flush()
-                                    csv_local_file.flush()
-
-                                if worksheet:
-                                    worksheet.append_rows(all_rows)
-
-                                # Initialize resighting counter
-                                post_resightings[post_id] = 0
-                                print(f"  *** POST: r/{sub} - {title[:50]}...", flush=True)
-                        except Exception as e:
-                            print(f"Error fetching r/{sub}: {e}", flush=True)
+                        author = p.get('author', '[deleted]')
+                        title = p['title']
+                        selftext = p.get('selftext', '')
+                        permalink = p['permalink']
+                        post_time = rss_time_to_csv(p.get('created', ''))
+                        caught_time = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')
+                        comment_rows = []
+                        if config['fetch_comments']:
+                            try:
+                                if not interruptible_sleep(config['comment_request_delay_sec']):
+                                    break
+                                comment_response = rss_session.get(
+                                    permalink.rstrip('/') + '/.rss', headers=rss_headers,
+                                    timeout=config['request_timeout_sec'],
+                                )
+                                comment_response.raise_for_status()
+                                for comment in parse_comment_rss(comment_response.text, p, config['max_comments_per_post']):
+                                    comment_key = f"comment:{comment['id']}"
+                                    if comment_key in seen_ids:
+                                        continue
+                                    seen_ids.add(comment_key)
+                                    comment_rows.append([
+                                        "Comment", post_id, comment['author'], "N/A", sub,
+                                        title, comment['body'], comment['permalink'],
+                                        rss_time_to_csv(comment['created']), "", caught_time, "",
+                                    ])
+                            except Exception as comment_error:
+                                cycle_errors += 1
+                                print(f"  Comment RSS failed for {post_id}: {comment_error}", flush=True)
+                        all_rows = [["Post", post_id, author, "N/A", sub, title, selftext,
+                                     permalink, post_time, len(comment_rows), caught_time, ""]]
+                        all_rows.extend(comment_rows)
+                        seen_ids.add(post_id)
+                        save_seen_ids(seen_ids)
+                        for row in all_rows:
+                            csv_writer.writerow(row)
+                            csv_local_writer.writerow(row)
+                            csv_file.flush()
+                            csv_local_file.flush()
+                        if worksheet:
+                            worksheet.append_rows(all_rows)
+                        post_resightings[post_id] = 0
+                        cycle_new_posts += 1
+                        cycle_new_comments += len(comment_rows)
+                        print(f"  *** POST: r/{sub} - {title[:50]}... ({len(comment_rows)} comments)", flush=True)
                     else:
-                        # POST RE-SIGHTED: increment counter (post is in top 50 again)
-                        if post_id not in post_resightings:
-                            post_resightings[post_id] = 0
-                        post_resightings[post_id] += 1
+                        if config['track_resightings']:
+                            if post_id not in post_resightings:
+                                post_resightings[post_id] = 0
+                            post_resightings[post_id] += 1
         except Exception as e:
-            print(f"Error r/{sub}: {e}", flush=True)
+            cycle_errors += 1
+            print(f"Error RSS batch {batch_label}: {e}", flush=True)
+            status_code = getattr(getattr(e, 'response', None), 'status_code', None)
+            if status_code == 403:
+                message = 'Reddit RSS access returned 403. The public feed is currently unavailable from this network.'
+                update_status(state='blocked', error=message, current_subreddit=batch_status_label,
+                              completed=completed_before, total=len(cycle_subs),
+                              errors=cycle_errors, new_posts=cycle_new_posts,
+                              new_comments=cycle_new_comments)
+                access_blocked = True
+                break
 
-        # Increased sleep to avoid rate limiting with expanded subreddit list
-        time.sleep(random.uniform(20, 30))
+        update_status(state='scanning', source='New Reddit RSS', current_subreddit=batch_status_label,
+                      current_batch=batch_index + 1, total_batches=len(batches), completed=completed_after,
+                      total=len(cycle_subs), errors=cycle_errors,
+                      new_posts=cycle_new_posts, new_comments=cycle_new_comments,
+                      active_keyword_set=active_set)
+        delay = random.uniform(config['subreddit_delay_min_sec'], config['subreddit_delay_max_sec'])
+        if not interruptible_sleep(delay):
+            break
 
     # Save resighting data after each cycle
     save_post_resightings(post_resightings)
-    time.sleep(random.uniform(600, 900))
+    if access_blocked:
+        break
+    if stop_requested() or not config['continuous']:
+        break
+    last_cycle_new_posts = cycle_new_posts
+    cycle_delay = random.uniform(config['cycle_delay_min_sec'], config['cycle_delay_max_sec'])
+    update_status(state='waiting', current_subreddit=None, completed=len(cycle_subs),
+                  total=len(cycle_subs), errors=cycle_errors,
+                  new_posts=cycle_new_posts, new_comments=cycle_new_comments,
+                  last_cycle_new_posts=last_cycle_new_posts,
+                  next_cycle_in_sec=round(cycle_delay))
+    if not interruptible_sleep(cycle_delay):
+        break
+
+if not locals().get('access_blocked', False):
+    update_status(state='stopped', current_subreddit=None, stop_requested=stop_requested())
+try:
+    os.remove(PID_PATH)
+except FileNotFoundError:
+    pass

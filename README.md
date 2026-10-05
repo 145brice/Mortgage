@@ -25,6 +25,31 @@ sync_csv_to_sheets.py ──→  Google Sheets (manual sync utility)
 
 ## How to Run
 
+### Separate top-50-city real-estate scraper
+
+`real_estate_scraper.py` starts with the 50 largest U.S. cities (Census Vintage
+2025) and monitors one city per distinct metropolitan statistical area. A
+lower-ranked city is skipped when its metro is already represented: Fort Worth
+(Dallas), Mesa (Phoenix), Long Beach (Los Angeles), Oakland (San Francisco),
+and Aurora (Denver). The result is 45 city subreddits across 45 unique metros.
+It searches post titles and bodies using every mortgage keyword set plus buying,
+selling, renting, investing, commercial, development, and agent/broker terms.
+Its data and deduplication state are completely separate from the mortgage
+scraper.
+
+```bash
+# One complete pass, then exit
+python real_estate_scraper.py --once
+
+# Run continuously (15 minutes between completed passes)
+python real_estate_scraper.py
+```
+
+Output is written to `real_estate_leads.csv`; deduplication state is stored in
+`real_estate_seen_ids.json`. To send matches to a separate Google Sheet, set
+`REAL_ESTATE_SHEET_ID` in `.env`. If that variable is absent, CSV-only mode is
+used. The original mortgage Sheet is never used implicitly.
+
 ### Install dependencies (first time only)
 ```bash
 python -m pip install flask gspread requests beautifulsoup4 python-dotenv

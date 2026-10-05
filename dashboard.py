@@ -1,20 +1,110 @@
-from flask import Flask, render_template_string, jsonify, Response
+from flask import Flask, render_template, render_template_string, jsonify, Response, request
+import ast
 import csv
 import os
+import subprocess
+import sys
 from datetime import datetime
 import json
 import threading
 import time
 import gspread
+from collections import defaultdict
+from zoneinfo import ZoneInfo
+from scraper_runtime import (
+    CONFIG_PATH, PID_PATH, STATUS_PATH, STOP_PATH, load_runtime_config,
+    request_stop, save_runtime_config,
+)
+from lead_scoring import score_lead
 
 app = Flask(__name__)
 
-CSV_PATH = r"C:\Users\user\OneDrive\Desktop\Reddit Mortgage\leads.csv"
+CSV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'leads.csv')
 SHEET_ID = '11iSHWnP7FhtmZqJ0h5eMtrO1fEvEH7iF84NvI9hbAVA'
 
 # Enable only if you want the script to automatically normalize/fix the header row in Sheets
 # WARNING: setting this to True will write to the spreadsheet's first row.
 AUTO_FIX_HEADERS = False
+
+SCRAPER_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scraper.py')
+SCRAPER_STDOUT = os.path.join(os.path.dirname(SCRAPER_PATH), 'scraper-live.stdout.log')
+SCRAPER_STDERR = os.path.join(os.path.dirname(SCRAPER_PATH), 'scraper-live.stderr.log')
+
+
+def scraper_pid():
+    try:
+        with open(PID_PATH, 'r', encoding='utf-8') as handle:
+            pid = int(handle.read().strip())
+        os.kill(pid, 0)
+        return pid
+    except (OSError, ValueError, SystemError):
+        return None
+
+
+def read_json_file(path, fallback):
+    try:
+        with open(path, 'r', encoding='utf-8') as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return fallback
+
+
+def tail_file(path, lines=35):
+    try:
+        with open(path, 'r', encoding='utf-8', errors='replace') as handle:
+            return ''.join(handle.readlines()[-lines:])
+    except OSError:
+        return ''
+
+
+def load_scraper_configuration():
+    """Read display-safe scraper settings without importing the long-running scraper."""
+    defaults = {
+        "SUBS": [], "CORE_KEYWORDS": [], "RATE_KEYWORDS": [],
+        "KEYWORDS_SET_A": [], "KEYWORDS_SET_B": [],
+    }
+    try:
+        with open(SCRAPER_PATH, 'r', encoding='utf-8') as source_file:
+            tree = ast.parse(source_file.read(), filename=SCRAPER_PATH)
+        for node in tree.body:
+            if not isinstance(node, ast.Assign):
+                continue
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id in defaults:
+                    value = ast.literal_eval(node.value)
+                    if isinstance(value, list):
+                        defaults[target.id] = value
+    except (OSError, SyntaxError, ValueError):
+        pass
+
+    return {
+        "subreddits": defaults["SUBS"],
+        "keyword_sets": {
+            "Always active — original": defaults["CORE_KEYWORDS"],
+            "Always active — rates": defaults["RATE_KEYWORDS"],
+            "Set A": defaults["KEYWORDS_SET_A"],
+            "Set B": defaults["KEYWORDS_SET_B"],
+        },
+        "timing": [
+            {"label": "Posts per subreddit", "value": "50 newest"},
+            {"label": "Request timeout", "value": "10 seconds"},
+            {"label": "Between subreddits", "value": "20–30 seconds, randomized"},
+            {"label": "Between full cycles", "value": "10–15 minutes, randomized"},
+            {"label": "Rate-limit pause", "value": "120 seconds"},
+            {"label": "Keyword rotation", "value": "Every hour (Central Time)"},
+            {"label": "Dashboard refresh", "value": "Every 5 seconds"},
+        ],
+        "toggles": [
+            {"label": "Scraper loop", "enabled": True, "detail": "Continuous"},
+            {"label": "Keyword rotation", "enabled": True, "detail": "Set A on even hours; Set B on odd hours"},
+            {"label": "Random subreddit order", "enabled": True, "detail": "Reshuffled each cycle"},
+            {"label": "Post re-sighting counts", "enabled": True, "detail": "Tracked for known posts"},
+            {"label": "Google Sheets sync", "enabled": True, "detail": "Used when credentials connect"},
+            {"label": "Automatic header repair", "enabled": AUTO_FIX_HEADERS, "detail": "Read-only safety setting"},
+            {"label": "Dashboard auto-refresh", "enabled": True, "detail": "5-second interval"},
+            {"label": "Central Time display", "enabled": True, "detail": "UTC retained in tooltips"},
+        ],
+    }
 
 def load_resightings():
     """Load post resighting counters."""
@@ -39,6 +129,7 @@ def read_csv_data():
 
     rows = []
     stats = {"posts": 0, "comments": 0}
+    daily_counts = defaultdict(lambda: {"posts": 0, "comments": 0, "total": 0})
     resightings = load_resightings()
 
     try:
@@ -49,6 +140,9 @@ def read_csv_data():
             for row in reader:
                 if row:
                     row_dict = {col: (row.get(col) or '') for col in header}
+                    lead_score, lead_reason = score_lead(row_dict)
+                    row_dict['Lead Score'] = lead_score
+                    row_dict['Lead Reason'] = lead_reason
 
                     # Add resighting count if this is a post
                     if row.get('Type') == 'Post':
@@ -63,6 +157,25 @@ def read_csv_data():
                         stats['posts'] += 1
                     elif row.get('Type') == 'Comment':
                         stats['comments'] += 1
+
+                    post_time = row.get('Post Time (UTC)', '')
+                    try:
+                        posted_utc = datetime.strptime(
+                            post_time.replace(' UTC', ''), '%Y-%m-%d %H:%M:%S'
+                        ).replace(tzinfo=ZoneInfo('UTC'))
+                        posted_date = posted_utc.astimezone(ZoneInfo('America/Chicago')).date().isoformat()
+                        daily_counts[posted_date]['total'] += 1
+                        if row.get('Type') == 'Post':
+                            daily_counts[posted_date]['posts'] += 1
+                        elif row.get('Type') == 'Comment':
+                            daily_counts[posted_date]['comments'] += 1
+                    except (ValueError, TypeError):
+                        pass
+
+        stats['by_caught_date'] = [
+            {"date": date, **counts}
+            for date, counts in sorted(daily_counts.items(), reverse=True)
+        ]
 
         print(f"CSV: Loaded {len(rows)} rows, posts={stats['posts']}, comments={stats['comments']}", flush=True)
 
@@ -550,7 +663,86 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def dashboard():
-    return render_template_string(HTML_TEMPLATE)
+    return render_template('dashboard.html')
+
+
+@app.route('/api/config')
+def get_config():
+    return jsonify(load_scraper_configuration())
+
+
+@app.route('/admin')
+def admin():
+    return render_template('admin.html')
+
+
+@app.route('/api/admin/status')
+def admin_status():
+    pid = scraper_pid()
+    status = read_json_file(STATUS_PATH, {})
+    status.update({
+        'running': pid is not None,
+        'pid': pid,
+        'config': load_runtime_config(),
+        'log': tail_file(SCRAPER_STDOUT),
+        'errors_log': tail_file(SCRAPER_STDERR, 12),
+    })
+    if pid is None and status.get('state') not in ('stopped', 'blocked', None):
+        status['state'] = 'stopped'
+    return jsonify(status)
+
+
+@app.route('/api/admin/config', methods=['POST'])
+def admin_config():
+    return jsonify({'ok': True, 'config': save_runtime_config(request.get_json(silent=True) or {})})
+
+
+@app.route('/api/admin/run', methods=['POST'])
+def admin_run():
+    existing = scraper_pid()
+    if existing:
+        return jsonify({'ok': True, 'message': 'Scraper is already running.', 'pid': existing})
+    try:
+        os.remove(STOP_PATH)
+    except FileNotFoundError:
+        pass
+    stdout = open(SCRAPER_STDOUT, 'w', encoding='utf-8')
+    stderr = open(SCRAPER_STDERR, 'w', encoding='utf-8')
+    flags = subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+    process = subprocess.Popen(
+        [sys.executable, '-u', SCRAPER_PATH], cwd=os.path.dirname(SCRAPER_PATH),
+        stdout=stdout, stderr=stderr, creationflags=flags,
+    )
+    stdout.close()
+    stderr.close()
+    with open(PID_PATH, 'w', encoding='utf-8') as handle:
+        handle.write(str(process.pid))
+    return jsonify({'ok': True, 'message': 'Scraper started.', 'pid': process.pid})
+
+
+@app.route('/api/admin/stop', methods=['POST'])
+def admin_stop():
+    pid = scraper_pid()
+    if not pid:
+        return jsonify({'ok': True, 'message': 'Scraper is already stopped.'})
+    request_stop()
+    return jsonify({'ok': True, 'message': 'Graceful stop requested. The current request will finish first.', 'pid': pid})
+
+
+@app.route('/api/admin/kill', methods=['POST'])
+def admin_kill():
+    pid = scraper_pid()
+    if not pid:
+        return jsonify({'ok': True, 'message': 'Scraper is already stopped.'})
+    if os.name == 'nt':
+        subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'], capture_output=True, check=False)
+    else:
+        os.kill(pid, 9)
+    try:
+        os.remove(PID_PATH)
+    except FileNotFoundError:
+        pass
+    return jsonify({'ok': True, 'message': 'Scraper stopped immediately.', 'pid': pid})
 
 @app.route('/api/debug')
 def debug():
@@ -623,6 +815,7 @@ def get_data():
     data = {
         'rows': sorted_rows,
         'stats': stats,
+        'scrape': read_json_file(STATUS_PATH, {}),
         'timestamp': datetime.now().isoformat()
     }
 
@@ -630,7 +823,7 @@ def get_data():
 
 if __name__ == '__main__':
     import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5000
+    port = int(sys.argv[1]) if len(sys.argv) > 1 else 5002
     print("Starting Reddit Mortgage Scraper Dashboard...", flush=True)
     print(f"Open your browser to: http://localhost:{port}", flush=True)
     app.run(debug=True, host='localhost', port=port, threaded=True)
